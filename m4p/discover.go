@@ -21,7 +21,7 @@ func NewDiscoverer(broadcastPort int) (*Discoverer, error) {
 
 	ln, err := net.ListenUDP("udp", &addr)
 	if err != nil {
-		panic(err)
+		return nil, err
 	}
 
 	d := &Discoverer{
