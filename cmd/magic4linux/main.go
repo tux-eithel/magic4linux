@@ -46,10 +46,10 @@ var keyMap = map[uint16]int{
 	0x0037: uinput.Key7,
 	0x0038: uinput.Key8,
 	0x0039: uinput.Key9,
+	0x0021: uinput.KeyPageup,    // Page Up
+	0x0022: uinput.KeyPagedown,  // Page Down
 	0x0193: uinput.KeyStop,      // Red button
 	0x0194: uinput.KeyPlaypause, // Green button
-	0x0195: uinput.KeyZ,         // Yellow button
-	0x0196: uinput.KeyC,         // Blue button
 	0x019D: uinput.KeyStop,      // Stop
 	0x019F: uinput.KeyPlaypause, // Play
 	0x01CD: uinput.KeyEsc,       // Back
@@ -169,7 +169,7 @@ func makeWSHandler(kbd uinput.Keyboard, mouse uinput.Mouse) http.HandlerFunc {
 					continue
 				}
 				delta := int16(binary.LittleEndian.Uint16(data[1:3]))
-				mouse.Wheel(false, int32(delta)) //nolint:errcheck
+				mouse.Wheel(false, int32(delta/2)) //nolint:errcheck
 
 			case msgVisible: // [0x03][visible uint8]
 				// Reset absolute tracking when the pointer leaves the screen.
@@ -219,11 +219,23 @@ func handleKey(kbd uinput.Keyboard, mouse uinput.Mouse, code uint16, down bool) 
 		} else {
 			mouse.LeftRelease() //nolint:errcheck
 		}
-	case 0x0002: // right mouse button
+	case 0x0002: // long-press on touchpad → right mouse button
 		if down {
 			mouse.RightPress() //nolint:errcheck
 		} else {
 			mouse.RightRelease() //nolint:errcheck
+		}
+	case 0x0195: // Yellow button → right mouse button
+		if down {
+			mouse.RightPress() //nolint:errcheck
+		} else {
+			mouse.RightRelease() //nolint:errcheck
+		}
+	case 0x0196: // Blue button → middle mouse button
+		if down {
+			mouse.MiddlePress() //nolint:errcheck
+		} else {
+			mouse.MiddleRelease() //nolint:errcheck
 		}
 	default:
 		if key, ok := keyMap[code]; ok {
