@@ -1,39 +1,81 @@
 package main
 
 import (
-	"bytes"
 	"context"
 	"encoding/binary"
 	"flag"
 	"fmt"
 	"log"
+	"net"
+	"net/http"
 	"os"
 	"os/signal"
 	"syscall"
 
 	"github.com/bendahl/uinput"
-
-	"github.com/mafredri/magic4linux/m4p"
+	"github.com/gorilla/websocket"
 )
 
-const broadcastPort = 42830
+// MagicRemoteService binary message types (byte 0 of every frame).
+const (
+	msgPositionRelative byte = 0x00
+	msgPositionAbsolute byte = 0x01
+	msgWheel            byte = 0x02
+	msgVisible          byte = 0x03
+	msgKey              byte = 0x04
+	msgUnicode          byte = 0x05
+	msgShutdown         byte = 0x06
+)
+
+// keyMap maps JavaScript keyCode values (sent by the TV app) to Linux uinput key codes.
+// See PROTOCOL.md for the full key-code table.
+var keyMap = map[uint16]int{
+	0x0008: uinput.KeyBackspace,
+	0x000D: uinput.KeyEnter,
+	0x0025: uinput.KeyLeft,
+	0x0026: uinput.KeyUp,
+	0x0027: uinput.KeyRight,
+	0x0028: uinput.KeyDown,
+	0x0030: uinput.Key0,
+	0x0031: uinput.Key1,
+	0x0032: uinput.Key2,
+	0x0033: uinput.Key3,
+	0x0034: uinput.Key4,
+	0x0035: uinput.Key5,
+	0x0036: uinput.Key6,
+	0x0037: uinput.Key7,
+	0x0038: uinput.Key8,
+	0x0039: uinput.Key9,
+	0x0193: uinput.KeyStop,      // Red button
+	0x0194: uinput.KeyPlaypause, // Green button
+	0x0195: uinput.KeyZ,         // Yellow button
+	0x0196: uinput.KeyC,         // Blue button
+	0x019D: uinput.KeyStop,      // Stop
+	0x019F: uinput.KeyPlaypause, // Play
+	0x01CD: uinput.KeyEsc,       // Back
+}
+
+var upgrader = websocket.Upgrader{
+	// Accept connections from any origin (the TV app does not send an Origin header).
+	CheckOrigin: func(r *http.Request) bool { return true },
+}
 
 func main() {
-	interval := flag.Int("interval", 16, "remote update interval in milliseconds (16 ≈ 60fps, lower = smoother)")
+	port := flag.Int("port", 41230, "TCP port to listen on (must match the port set in the MagicRemoteService TV app)")
 	flag.Parse()
 
 	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer cancel()
 
-	if err := run(ctx, *interval); err != nil {
+	if err := run(ctx, *port); err != nil {
 		log.Fatal(err)
 	}
 }
 
-func run(ctx context.Context, interval int) error {
+func run(ctx context.Context, port int) error {
 	kbd, err := uinput.CreateKeyboard("/dev/uinput", []byte("magic4linux-keyboard"))
 	if err != nil {
-		return fmt.Errorf("create keyboard: %w\nTip: add yourself to the input group: sudo usermod -aG input $USER && newgrp input", err)
+		return fmt.Errorf("create keyboard: %w\nTip: sudo usermod -aG input $USER && newgrp input", err)
 	}
 	defer kbd.Close()
 
@@ -43,166 +85,155 @@ func run(ctx context.Context, interval int) error {
 	}
 	defer mouse.Close()
 
-	d, err := m4p.NewDiscoverer(broadcastPort)
+	mux := http.NewServeMux()
+	mux.HandleFunc("/", makeWSHandler(kbd, mouse))
+
+	srv := &http.Server{
+		Addr:    fmt.Sprintf(":%d", port),
+		Handler: mux,
+	}
+
+	go func() {
+		<-ctx.Done()
+		srv.Shutdown(context.Background()) //nolint:errcheck
+	}()
+
+	ln, err := net.Listen("tcp", srv.Addr)
 	if err != nil {
 		return err
 	}
-	defer d.Close()
 
-	log.Printf("Listening for magic4pc TV app on UDP broadcast port %d ...", broadcastPort)
-	log.Printf("Open the magic4pc app on your LG TV and connect it to this machine.")
+	log.Printf("Listening on TCP port %d — open MagicRemoteService on your LG TV and point it at this machine's IP.", port)
 
-	for {
-		select {
-		case <-ctx.Done():
-			return nil
-		case dev := <-d.NextDevice():
-			if err := connect(ctx, dev, kbd, mouse, interval); err != nil {
-				log.Printf("connection lost: %v", err)
+	if err := srv.Serve(ln); err != nil && err != http.ErrServerClosed {
+		return err
+	}
+	return nil
+}
+
+func makeWSHandler(kbd uinput.Keyboard, mouse uinput.Mouse) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		conn, err := upgrader.Upgrade(w, r, nil)
+		if err != nil {
+			log.Printf("WebSocket upgrade failed: %v", err)
+			return
+		}
+		defer conn.Close()
+
+		log.Printf("TV connected from %s", r.RemoteAddr)
+		defer log.Printf("TV disconnected from %s", r.RemoteAddr)
+
+		// lastX/lastY track the previous absolute pointer position so we can
+		// convert PositionAbsolute frames into relative mouse deltas.
+		// hasAbsPos is reset on Visible=false to avoid jumps on re-entry.
+		var (
+			lastX, lastY int16
+			hasAbsPos    bool
+		)
+
+		for {
+			msgType, data, err := conn.ReadMessage()
+			if err != nil {
+				if websocket.IsUnexpectedCloseError(err, websocket.CloseGoingAway, websocket.CloseNormalClosure) {
+					log.Printf("connection error: %v", err)
+				}
+				return
+			}
+			if msgType != websocket.BinaryMessage || len(data) == 0 {
+				continue
+			}
+
+			switch data[0] {
+			case msgPositionRelative: // [0x00][dx int16 LE][dy int16 LE]
+				if len(data) < 5 {
+					continue
+				}
+				dx := int16(binary.LittleEndian.Uint16(data[1:3]))
+				dy := int16(binary.LittleEndian.Uint16(data[3:5]))
+				moveMouse(mouse, dx, dy)
+
+			case msgPositionAbsolute: // [0x01][x uint16 LE 0–1920][y uint16 LE 0–1080]
+				if len(data) < 5 {
+					continue
+				}
+				x := int16(binary.LittleEndian.Uint16(data[1:3]))
+				y := int16(binary.LittleEndian.Uint16(data[3:5]))
+				if hasAbsPos {
+					moveMouse(mouse, x-lastX, y-lastY)
+				}
+				hasAbsPos = true
+				lastX, lastY = x, y
+
+			case msgWheel: // [0x02][sY int16 LE]
+				if len(data) < 3 {
+					continue
+				}
+				delta := int16(binary.LittleEndian.Uint16(data[1:3]))
+				mouse.Wheel(false, int32(delta)) //nolint:errcheck
+
+			case msgVisible: // [0x03][visible uint8]
+				// Reset absolute tracking when the pointer leaves the screen.
+				hasAbsPos = false
+
+			case msgKey: // [0x04][keyCode uint16 LE][state uint8: 0x01=down, 0x00=up]
+				if len(data) < 4 {
+					continue
+				}
+				code := binary.LittleEndian.Uint16(data[1:3])
+				down := data[3] == 0x01
+				handleKey(kbd, mouse, code, down)
+
+			case msgUnicode: // [0x05][codePoint uint16 LE]
+				if len(data) >= 3 {
+					log.Printf("unicode input U+%04X (not supported via uinput)", binary.LittleEndian.Uint16(data[1:3]))
+				}
+
+			case msgShutdown:
+				log.Printf("TV requested system shutdown")
+
+			default:
+				log.Printf("unknown message 0x%02X: %X", data[0], data)
 			}
 		}
 	}
 }
 
-func connect(ctx context.Context, dev m4p.DeviceInfo, kbd uinput.Keyboard, mouse uinput.Mouse, interval int) error {
-	addr := fmt.Sprintf("%s:%d", dev.IPAddr, dev.Port)
-	log.Printf("Connecting to %s (model: %s)...", addr, dev.Model)
-
-	client, err := m4p.Dial(ctx, addr, m4p.WithUpdateFrequency(interval))
-	if err != nil {
-		return err
+func moveMouse(mouse uinput.Mouse, dx, dy int16) {
+	if dx < 0 {
+		mouse.MoveLeft(int32(-dx)) //nolint:errcheck
+	} else if dx > 0 {
+		mouse.MoveRight(int32(dx)) //nolint:errcheck
 	}
-	defer client.Close()
+	if dy < 0 {
+		mouse.MoveUp(int32(-dy)) //nolint:errcheck
+	} else if dy > 0 {
+		mouse.MoveDown(int32(dy)) //nolint:errcheck
+	}
+}
 
-	log.Printf("Connected. Use your LG Magic Remote to control the mouse.")
-
-	// lastX/lastY track the previous absolute IR pointer position so we can
-	// compute relative deltas for the mouse. hasPointer is reset whenever the
-	// pointer leaves the screen to avoid a big jump on re-entry.
-	var (
-		lastX, lastY int32
-		hasPointer   bool
-	)
-
-	for {
-		m, err := client.Recv(ctx)
-		if err != nil {
-			return err
+func handleKey(kbd uinput.Keyboard, mouse uinput.Mouse, code uint16, down bool) {
+	switch code {
+	case 0x0001: // pointer click → left mouse button
+		if down {
+			mouse.LeftPress() //nolint:errcheck
+		} else {
+			mouse.LeftRelease() //nolint:errcheck
 		}
-
-		switch m.Type {
-		case m4p.RemoteUpdateMessage:
-			// Binary payload layout (little-endian):
-			//   1 byte  returnValue  — 0 = pointer not on screen
-			//   1 byte  deviceID
-			//   4 bytes coordinate X (int32)
-			//   4 bytes coordinate Y (int32)
-			//   ... gyroscope/acceleration/quaternion (unused)
-			r := bytes.NewReader(m.RemoteUpdate.Payload)
-			var returnValue, deviceID uint8
-			var coordinate [2]int32
-			if err := binary.Read(r, binary.LittleEndian, &returnValue); err != nil {
-				continue
-			}
-			if err := binary.Read(r, binary.LittleEndian, &deviceID); err != nil {
-				continue
-			}
-			if err := binary.Read(r, binary.LittleEndian, coordinate[:]); err != nil {
-				continue
-			}
-
-			// returnValue == 0 means the IR pointer is off-screen.
-			// Reset tracking so the cursor doesn't jump when it comes back.
-			if returnValue == 0 {
-				hasPointer = false
-				continue
-			}
-
-			x, y := coordinate[0], coordinate[1]
-			if hasPointer {
-				dx := x - lastX
-				dy := y - lastY
-				if dx < 0 {
-					mouse.MoveLeft(-dx) //nolint:errcheck
-				} else if dx > 0 {
-					mouse.MoveRight(dx) //nolint:errcheck
-				}
-				if dy < 0 {
-					mouse.MoveUp(-dy) //nolint:errcheck
-				} else if dy > 0 {
-					mouse.MoveDown(dy) //nolint:errcheck
-				}
-			}
-			hasPointer = true
-			lastX, lastY = x, y
-
-		case m4p.MouseMessage:
-			// Fired when the user clicks the Magic Remote's scroll-wheel button
-			// while the IR pointer is active.
-			switch m.Mouse.Type {
-			case "mousedown":
-				mouse.LeftPress() //nolint:errcheck
-			case "mouseup":
-				mouse.LeftRelease() //nolint:errcheck
-			}
-
-		case m4p.WheelMessage:
-			mouse.Wheel(false, m.Wheel.Delta) //nolint:errcheck
-
-		case m4p.InputMessage:
-			key := m.Input.Parameters.KeyCode
-			switch key {
-			case m4p.KeyWheelPressed:
-				key = uinput.KeyEnter
-			case m4p.KeyChannelUp:
-				key = uinput.KeyPageup
-			case m4p.KeyChannelDown:
-				key = uinput.KeyPagedown
-			case m4p.KeyLeft:
-				key = uinput.KeyLeft
-			case m4p.KeyUp:
-				key = uinput.KeyUp
-			case m4p.KeyRight:
-				key = uinput.KeyRight
-			case m4p.KeyDown:
-				key = uinput.KeyDown
-			case m4p.Key0:
-				key = uinput.Key0
-			case m4p.Key1:
-				key = uinput.Key1
-			case m4p.Key2:
-				key = uinput.Key2
-			case m4p.Key3:
-				key = uinput.Key3
-			case m4p.Key4:
-				key = uinput.Key4
-			case m4p.Key5:
-				key = uinput.Key5
-			case m4p.Key6:
-				key = uinput.Key6
-			case m4p.Key7:
-				key = uinput.Key7
-			case m4p.Key8:
-				key = uinput.Key8
-			case m4p.Key9:
-				key = uinput.Key9
-			case m4p.KeyRed:
-				key = uinput.KeyStop
-			case m4p.KeyGreen:
-				key = uinput.KeyPlaypause
-			case m4p.KeyYellow:
-				key = uinput.KeyZ
-			case m4p.KeyBlue:
-				key = uinput.KeyC
-			case m4p.KeyBack:
-				key = uinput.KeyBackspace
-			}
-
-			if m.Input.Parameters.IsDown {
+	case 0x0002: // right mouse button
+		if down {
+			mouse.RightPress() //nolint:errcheck
+		} else {
+			mouse.RightRelease() //nolint:errcheck
+		}
+	default:
+		if key, ok := keyMap[code]; ok {
+			if down {
 				kbd.KeyDown(key) //nolint:errcheck
 			} else {
 				kbd.KeyUp(key) //nolint:errcheck
 			}
+		} else {
+			log.Printf("unmapped key 0x%04X (down=%v) — add it to keyMap if needed", code, down)
 		}
 	}
 }
