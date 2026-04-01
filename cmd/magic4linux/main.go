@@ -169,7 +169,7 @@ func makeWSHandler(kbd uinput.Keyboard, mouse uinput.Mouse) http.HandlerFunc {
 					continue
 				}
 				delta := int16(binary.LittleEndian.Uint16(data[1:3]))
-				mouse.Wheel(false, int32(delta/2)) //nolint:errcheck
+				mouse.Wheel(false, int32(delta/20)) //nolint:errcheck
 
 			case msgVisible: // [0x03][visible uint8]
 				// Reset absolute tracking when the pointer leaves the screen.
